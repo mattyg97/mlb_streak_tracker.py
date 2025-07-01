@@ -1,93 +1,81 @@
 import streamlit as st
 import requests
 import pandas as pd
+from datetime import datetime
 
 st.set_page_config(page_title="MLB Player Streak Tracker", layout="wide")
-st.title("⚾ MLB Active Player Streaks (2025)")
+st.title("⚾ MLB Active Player Streaks — Current 2025 Season")
 
-SEASON = 2025
+SEASON = datetime.now().year  # Auto-detect current year
 BASE_URL = "https://statsapi.mlb.com/api/v1"
 
 @st.cache_data(ttl=86400)
 def get_active_hitters():
-    url = f"{BASE_URL}/teams?sportId=1"
-    teams = requests.get(url).json()["teams"]
-    all_players = []
-    for team in teams:
-        team_id = team["id"]
-        roster_url = f"{BASE_URL}/teams/{team_id}/roster?rosterType=active"
-        r = requests.get(roster_url).json()
-        for player in r["roster"]:
-            pos = player["position"]["abbreviation"]
-            if pos in ["DH", "1B", "2B", "3B", "SS", "LF", "CF", "RF", "C"]:
-                all_players.append({
-                    "id": player["person"]["id"],
-                    "name": player["person"]["fullName"],
-                    "team": team["name"]
+    teams = requests.get(f"{BASE_URL}/teams?sportId=1").json()["teams"]
+    players = []
+    for t in teams:
+        roster = requests.get(f"{BASE_URL}/teams/{t['id']}/roster?rosterType=active").json()["roster"]
+        for p in roster:
+            pos = p["position"]["abbreviation"]
+            if pos in ["DH","1B","2B","3B","SS","LF","CF","RF","C"]:
+                players.append({
+                    "id": p["person"]["id"],
+                    "name": p["person"]["fullName"],
+                    "team": t["name"]
                 })
-    return all_players
+    return players
 
-def fetch_game_logs(player_id, limit=20):
-    url = f"https://statsapi.mlb.com/api/v1/people/{player_id}/stats"
-    params = {
-        "stats": "gameLog",
-        "season": SEASON
-    }
-    r = requests.get(url, params=params).json()
-    try:
-        return r["stats"][0]["splits"][:limit]
-    except:
-        return []
+def fetch_game_logs(player_id, limit=25):
+    res = requests.get(f"{BASE_URL}/people/{player_id}/stats", params={"stats":"gameLog","season":SEASON}).json()
+    splits = res.get("stats", [{}])[0].get("splits", [])
+    return splits[:limit] if splits else []
 
-def calculate_streak(logs, stat_key, condition_fn):
+def calculate_streak(logs, stat_key, cond):
     streak = 0
     for g in logs:
         val = g["stat"].get(stat_key, 0)
-        if condition_fn(val):
+        if cond(val):
             streak += 1
         else:
             break
     return streak
 
 @st.cache_data(ttl=3600)
-def build_streak_data():
+def build_streak_data(min_total_bases=2):
     players = get_active_hitters()
-    streaks = []
+    rows = []
     for p in players:
         logs = fetch_game_logs(p["id"])
         if not logs:
             continue
 
-        hit_streak = calculate_streak(logs, "hits", lambda h: h > 0)
-        rbi_streak = calculate_streak(logs, "rbi", lambda r: r > 0)
-        run_streak = calculate_streak(logs, "runs", lambda r: r > 0)
-        tb_streak = calculate_streak(logs, "totalBases", lambda tb: tb >= 2)
+        hit_str = calculate_streak(logs, "hits", lambda x:x>0)
+        rbi_str = calculate_streak(logs, "rbi", lambda x:x>0)
+        run_str = calculate_streak(logs, "runs", lambda x:x>0)
+        tb_str = calculate_streak(logs, "totalBases", lambda x: x>=min_total_bases)
 
-        if max(hit_streak, rbi_streak, run_streak, tb_streak) == 0:
-            continue  # Skip players with no streaks
+        if max(hit_str, rbi_str, run_str, tb_str) == 0:
+            continue
 
-        streaks.append({
+        rows.append({
             "Player": p["name"],
             "Team": p["team"],
-            "Hitting": hit_streak,
-            "RBI": rbi_streak,
-            "Total Bases (2+)": tb_streak,
-            "Runs": run_streak
+            "Hitting": hit_str,
+            "RBI": rbi_str,
+            f"Total Bases ({min_total_bases}+)": tb_str,
+            "Runs": run_str
         })
+    return pd.DataFrame(rows)
 
-    return pd.DataFrame(streaks)
+# Sidebar controls
+default_tb = st.number_input("Minimum total bases for TB streak", min_value=1, max_value=6, value=2)
+min_len = st.slider("Minimum streak length to show", 1, 15, 2)
+sort_choice = st.selectbox("Sort by streak type", ["Hitting","RBI",f"Total Bases ({default_tb}+)", "Runs"])
+teams = build_streak_data(min_total_bases=default_tb)
+filtered = teams[teams[sort_choice] >= min_len]
+team_select = st.multiselect("Filter by team", options=sorted(filtered["Team"].unique()))
+if team_select:
+    filtered = filtered[filtered["Team"].isin(team_select)]
 
-df = build_streak_data()
-
-# ---------------- UI ----------------
-min_length = st.slider("Minimum streak length to show", 1, 15, 2)
-sort_by = st.selectbox("Sort by", ["Hitting", "RBI", "Total Bases (2+)", "Runs"])
-team_filter = st.multiselect("Filter by team", options=sorted(df["Team"].unique()))
-
-df_filtered = df[df[sort_by] >= min_length]
-if team_filter:
-    df_filtered = df_filtered[df_filtered["Team"].isin(team_filter)]
-
-df_sorted = df_filtered.sort_values(by=sort_by, ascending=False)
-st.subheader(f"Active Player Streaks (Sorted by {sort_by})")
-st.dataframe(df_sorted.reset_index(drop=True), use_container_width=True)
+st.subheader("Current Active Streaks")
+st.dataframe(filtered.sort_values(by=sort_choice, ascending=False).reset_index(drop=True), use_container_width=True)
